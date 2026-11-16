@@ -502,3 +502,58 @@ def test_vlm_cache_layout_and_prompt_cache_round_trip(monkeypatch, layout):
     a = lm(tok, cache=cache).logits
     b = lm(tok, cache=restored).logits
     assert mx.allclose(a, b, atol=1e-5).item(), mx.abs(a - b).max().item()
+
+
+@pytest.mark.parametrize("layout", ["full", "factored"])
+@pytest.mark.parametrize("fused", [True, False])
+def test_cache_snapshots_are_isolated_from_later_requests(monkeypatch, layout, fused):
+    """mlx-engine's prompt cache keeps deepcopy snapshots (checkpoint before the end of the
+    prompt, live cache after the generation) and restores them for later requests. A request
+    that restarts from an older snapshot and writes a different continuation must not change
+    what the other snapshots hold."""
+    monkeypatch.setattr(olala_model, "_ACT_F32", True)
+    monkeypatch.setattr(olala_model, "_TPA_CACHE", layout)
+    monkeypatch.setenv("OLALA_FUSED", "1" if fused else "0")
+    m = _tiny_model()
+    V = TINY["vocab_size"]
+    prefix = mx.random.randint(0, V, (1, 23))
+    first = mx.random.randint(0, V, (1, 9))  # request 1: rest of its prompt
+    other = mx.random.randint(0, V, (1, 14))  # request 2: a different continuation
+    probe = mx.random.randint(0, V, (1, 1))
+
+    def decode(cache, tokens):
+        out = None
+        for i in range(tokens.shape[1]):
+            out = m(tokens[:, i : i + 1], cache=cache).astype(mx.float32)[:, -1]
+            mx.eval(out)
+        return out
+
+    def request_1(cache):
+        mx.eval(m(first, cache=cache))
+        decode(cache, first[:, :5])  # "generated" tokens
+
+    # reference: request 1 alone, then the probe token
+    ref_cache = m.make_cache()
+    mx.eval(m(prefix, cache=ref_cache))
+    request_1(ref_cache)
+    ref = decode(ref_cache, probe)
+
+    live = m.make_cache()
+    mx.eval(m(prefix, cache=live))
+    checkpoint = copy.deepcopy(live)
+    request_1(live)
+    after_request_1 = copy.deepcopy(live)
+
+    # request 2 restarts from the checkpoint and overwrites the same positions
+    live = copy.deepcopy(checkpoint)
+    mx.eval(m(other, cache=live))
+    decode(live, other[:, :6])
+
+    # request 3 continues request 1
+    got = decode(copy.deepcopy(after_request_1), probe)
+    assert mx.allclose(ref, got, atol=2e-3, rtol=2e-3).item(), mx.abs(ref - got).max().item()
+    # and the checkpoint still gives request 1's result
+    live = copy.deepcopy(checkpoint)
+    request_1(live)
+    got = decode(live, probe)
+    assert mx.allclose(ref, got, atol=2e-3, rtol=2e-3).item(), mx.abs(ref - got).max().item()
