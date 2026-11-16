@@ -273,7 +273,12 @@ class MlxEngineRequestHandler(BaseHTTPRequestHandler):
                 request_id=session.request_id,
                 prompt_progress_reporter=reporter,
             )
-            self._stream_generation(generator, reporter)
+            self._stream_generation(
+                generator,
+                reporter,
+                channel_reasoning_open=request.channel_reasoning_open,
+                channel_tools=request.channel_tools,
+            )
             normal_completion = True
         except _ClientConnectionError:
             logger.debug("Generation client disconnected: %s", session.request_id)
@@ -297,30 +302,64 @@ class MlxEngineRequestHandler(BaseHTTPRequestHandler):
         self,
         generator: Iterator[GenerationResult],
         reporter: _SsePromptProgressReporter,
+        *,
+        channel_reasoning_open: bool | None = None,
+        channel_tools: bool = False,
     ) -> None:
         completion_tokens = 0
         terminal_sent = False
+        channel_parser = None
+        if channel_reasoning_open is not None:
+            from mlx_engine.models.olala.parser import ChannelParser
+
+            channel_parser = ChannelParser(reasoning_open=channel_reasoning_open)
+
+        def write_delta(delta: dict) -> None:
+            self._write_sse_json(
+                {"choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+            )
+
+        def write_channels(channels) -> None:
+            if channels.reasoning:
+                write_delta({"reasoning_content": channels.reasoning})
+            if channels.content:
+                write_delta({"content": channels.content})
 
         for result in generator:
             completion_tokens += len(result.tokens)
-            if result.text != "":
-                self._write_sse_json(
-                    {
-                        "choices": [
+            tool_calls = []
+            if channel_parser is not None:
+                write_channels(channel_parser.feed(result.text))
+                if result.stop_condition is not None:
+                    write_channels(channel_parser.finish())
+                    if channel_tools:
+                        tool_calls = channel_parser.tool_calls
+                    if tool_calls:
+                        write_delta(
                             {
-                                "index": 0,
-                                "delta": {"content": result.text},
-                                "finish_reason": None,
+                                "tool_calls": [
+                                    {
+                                        "index": index,
+                                        "id": call.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": call.name,
+                                            "arguments": call.arguments,
+                                        },
+                                    }
+                                    for index, call in enumerate(tool_calls)
+                                ]
                             }
-                        ]
-                    }
-                )
+                        )
+            elif result.text != "":
+                write_delta({"content": result.text})
             if result.stop_condition is not None:
                 self._write_sse_json(
                     self._terminal_payload(
                         stop_condition=result.stop_condition,
                         prompt_tokens=reporter.prompt_tokens,
                         completion_tokens=completion_tokens,
+                        has_tool_calls=bool(tool_calls),
                     )
                 )
                 terminal_sent = True
@@ -335,10 +374,11 @@ class MlxEngineRequestHandler(BaseHTTPRequestHandler):
         stop_condition: GenerationStopCondition,
         prompt_tokens: int,
         completion_tokens: int,
+        has_tool_calls: bool = False,
     ) -> dict:
         stop_reason = stop_condition.stop_reason
         if stop_reason == "eos_token":
-            finish_reason = "stop"
+            finish_reason = "tool_calls" if has_tool_calls else "stop"
             stop_metadata = {"stop_type": "eos"}
         elif stop_reason == "stop_string":
             finish_reason = "stop"
