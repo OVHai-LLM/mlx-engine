@@ -871,3 +871,102 @@ def test_runtime_unloads_model():
     runtime.unload()
 
     assert unload_calls == [model_kit]
+
+
+class _FakeOlalaRenderer:
+    chat_template = "model template"
+
+    def apply_chat_template(self, messages, **kwargs):
+        return "<|im_start|>assistant<|channel_start|>analysis<|content|>"
+
+
+class _FakeOlalaModelKit:
+    model_type = "olala"
+
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.tokenizer._tokenizer = _FakeOlalaRenderer()
+
+
+def _olala_stream(segments, *, tools, stop_reason="eos_token"):
+    def create_generator(_model_kit, _prompt_tokens, **_kwargs):
+        for index, segment in enumerate(segments):
+            last = index == len(segments) - 1
+            yield GenerationResult(
+                text=segment,
+                tokens=[Token(id=index, text=segment, logprob=0.0)],
+                top_logprobs=[],
+                stop_condition=GenerationStopCondition(
+                    stop_reason=stop_reason, stop_string="", stop_tokens=[2]
+                )
+                if last
+                else None,
+            )
+
+    runtime = EngineRuntime(
+        _FakeOlalaModelKit(),
+        supports_vision=False,
+        create_generator_fn=create_generator,
+        get_runtime_load_info_fn=lambda _model_kit: {},
+        tokenize_fn=lambda _model_kit, _prompt: [1],
+    )
+    body = _request_body()
+    if tools:
+        body["tools"] = [{"type": "function", "function": {"name": "search"}}]
+    with _running_server(runtime) as port:
+        status, response_text = _request(
+            port, "POST", "/v1/chat/completions", body=body
+        )
+    assert status == 200
+    choices = [e["choices"][0] for e in _parse_sse(response_text) if "choices" in e]
+    deltas = [c["delta"] for c in choices if c["delta"]]
+    return deltas, choices[-1]["finish_reason"]
+
+
+_OLALA_TOOL_TURN = [
+    "I should se",
+    "arch.<|chan",  # a marker split across two segments
+    "nel_end|><|channel_start|>final<|content|><|channel_end|>",
+    '<|channel_start|>tools<|content|><toolcalls><call id="call_0"><name>search</name>',
+    '<arguments>{"query":  "mlx"}</arguments></call></toolcalls><|channel_end|>',
+]
+
+
+def test_olala_stream_splits_reasoning_content_and_tool_calls():
+    deltas, finish_reason = _olala_stream(_OLALA_TOOL_TURN, tools=True)
+
+    assert "".join(d.get("reasoning_content", "") for d in deltas) == "I should search."
+    assert all("content" not in d for d in deltas)
+    assert deltas[-1] == {
+        "tool_calls": [
+            {
+                "index": 0,
+                "id": "call_0",
+                "type": "function",
+                "function": {"name": "search", "arguments": '{"query": "mlx"}'},
+            }
+        ]
+    }
+    assert finish_reason == "tool_calls"
+
+
+def test_olala_stream_without_tools_returns_reasoning_and_content_only():
+    segments = [
+        "think<|channel_end|><|channel_start|>final<|content|>Hel",
+        "lo<|channel_end|>",
+    ]
+    deltas, finish_reason = _olala_stream(segments, tools=False)
+
+    assert deltas == [
+        {"reasoning_content": "think"},
+        {"content": "Hel"},
+        {"content": "lo"},
+    ]
+    assert finish_reason == "stop"
+
+
+def test_olala_tool_calls_are_not_returned_when_no_tools_were_offered():
+    deltas, finish_reason = _olala_stream(_OLALA_TOOL_TURN, tools=False)
+
+    assert all("tool_calls" not in d for d in deltas)
+    assert finish_reason == "stop"

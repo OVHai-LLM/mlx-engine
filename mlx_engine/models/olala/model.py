@@ -24,6 +24,7 @@ Cache layout (one entry per layer):
     of the last token, the token-shift input)
 """
 
+import copy
 import math
 import os
 from dataclasses import dataclass
@@ -107,6 +108,18 @@ class ModelArgs(BaseModelArgs):
             )
 
 
+def _own_array_handles(cache):
+    """Give a copied cache its own mx.array objects (same buffers, no data copied).
+
+    ``a[i:j] = v`` rebinds the Python array object it is applied to. Two caches holding the
+    same object would therefore both see a slice append made through either of them: a
+    request restarting from an older snapshot overwrote the positions that later snapshots
+    of the same prompt cache still read (wrong context after a prompt cache hit)."""
+    for name, value in cache.__dict__.items():
+        if isinstance(value, mx.array):
+            cache.__dict__[name] = copy.copy(value)
+
+
 class InplaceAppendMixin:
     """KVCache mixin that lets the fused decode path append to the cache in place.
 
@@ -146,6 +159,7 @@ class InplaceAppendMixin:
     def _shared_copy(self):
         c = self.__class__.__new__(self.__class__)
         c.__dict__.update(self.__dict__)
+        _own_array_handles(c)
         if self.keys is not None:
             self._hw = c._hw = self.keys.shape[2]
         return c
@@ -300,6 +314,7 @@ class FactoredKVCache(_MlxKVCache):
     def _shared_copy(self):
         c = self.__class__.__new__(self.__class__)
         c.__dict__.update(self.__dict__)
+        _own_array_handles(c)
         if self.rows_k is not None:
             self._hw = c._hw = self.cap
         return c
@@ -465,6 +480,7 @@ class BatchFactoredKVCache(_MlxBatchKVCache):
     def _shared_copy(self):
         c = self.__class__.__new__(self.__class__)
         c.__dict__.update(self.__dict__)
+        _own_array_handles(c)
         if self.rows_k is not None:
             self._hw = c._hw = self.cap
         return c

@@ -627,3 +627,114 @@ def test_text_model_rejects_image_request():
             supports_vision=False,
             tokenize=lambda _model_kit, _prompt: [],
         )
+
+
+class _FakeOlalaModelKit(_FakeTextModelKit):
+    model_type = "olala"
+
+
+_SEARCH_TOOL = {"type": "function", "function": {"name": "search"}}
+
+
+def test_olala_tools_are_rendered_and_tool_call_arguments_become_objects():
+    renderer = _FakeRenderer()
+    request = prepare_chat_generation_request(
+        _base_request(
+            tools=[_SEARCH_TOOL],
+            messages=[
+                {"role": "user", "content": "Find it"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_0",
+                            "type": "function",
+                            "function": {
+                                "name": "search",
+                                "arguments": '{"query": "it"}',
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_0", "content": "found"},
+            ],
+        ),
+        model_kit=_FakeOlalaModelKit(renderer),
+        supports_vision=False,
+        tokenize=lambda _model_kit, _prompt: [],
+    )
+
+    messages, kwargs = renderer.calls[0]
+    assert kwargs["tools"] == [_SEARCH_TOOL]
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == {"query": "it"}
+    assert request.channel_tools is True
+    # the fake prompt does not end inside the reasoning channel
+    assert request.channel_reasoning_open is False
+
+
+def test_olala_tool_choice_none_hides_the_tools():
+    renderer = _FakeRenderer()
+    request = prepare_chat_generation_request(
+        _base_request(tools=[_SEARCH_TOOL], tool_choice="none"),
+        model_kit=_FakeOlalaModelKit(renderer),
+        supports_vision=False,
+        tokenize=lambda _model_kit, _prompt: [],
+    )
+
+    assert "tools" not in renderer.calls[0][1]
+    assert request.channel_tools is False
+
+
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({"tool_choice": "required"}, "tool_choice must be"),
+        (
+            {"tool_choice": {"type": "function", "function": {"name": "search"}}},
+            "tool_choice must be",
+        ),
+        (
+            {
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"schema": {"type": "object"}},
+                }
+            },
+            "Structured output is not supported with tools",
+        ),
+    ],
+)
+def test_olala_unsupported_tool_requests_are_rejected(overrides, message):
+    renderer = _FakeRenderer()
+    with pytest.raises(ChatRequestError, match=message):
+        prepare_chat_generation_request(
+            _base_request(tools=[_SEARCH_TOOL], **overrides),
+            model_kit=_FakeOlalaModelKit(renderer),
+            supports_vision=False,
+            tokenize=lambda _model_kit, _prompt: [],
+        )
+    assert renderer.calls == []
+
+
+def test_olala_invalid_past_tool_call_arguments_are_rejected():
+    with pytest.raises(ChatRequestError, match="must be a JSON object"):
+        prepare_chat_generation_request(
+            _base_request(
+                messages=[
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "c",
+                                "function": {"name": "search", "arguments": "{"},
+                            }
+                        ],
+                    },
+                    {"role": "user", "content": "again"},
+                ]
+            ),
+            model_kit=_FakeOlalaModelKit(_FakeRenderer()),
+            supports_vision=False,
+            tokenize=lambda _model_kit, _prompt: [],
+        )

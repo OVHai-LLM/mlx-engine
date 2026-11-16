@@ -95,6 +95,7 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
     tools: list[dict] | None = None
+    tool_choice: object | None = None
     response_format: _JsonSchemaResponseFormat | None = None
     chat_template_kwargs: dict = Field(default_factory=dict)
 
@@ -103,6 +104,11 @@ class ChatCompletionRequest(BaseModel):
 class ChatGenerationRequest:
     prompt_tokens: list[int]
     generation_kwargs: dict[str, object]
+    # Olala only: whether the prompt ends inside the reasoning channel. When set, the
+    # generated text is split into reasoning_content / content (None: text sent as is).
+    channel_reasoning_open: bool | None = None
+    # Olala only: tools were given to the model, its tool calls are returned as tool_calls.
+    channel_tools: bool = False
 
 
 def _validate_image_pixel_count(pixel_count: int) -> None:
@@ -173,6 +179,30 @@ def normalize_messages(
     return normalized_messages, images_b64
 
 
+def _is_olala(model_kit: object) -> bool:
+    return getattr(model_kit, "model_type", None) == "olala"
+
+
+def _olala_tool_messages(messages: list[dict]) -> list[dict]:
+    """OpenAI clients send the arguments of a past tool call as a JSON string; the Olala
+    chat template renders them with `tojson` and needs the object."""
+    for message in messages:
+        for tool_call in message.get("tool_calls") or []:
+            function = (
+                tool_call.get("function") if isinstance(tool_call, dict) else None
+            )
+            if isinstance(function, dict) and isinstance(
+                function.get("arguments"), str
+            ):
+                try:
+                    function["arguments"] = json.loads(function["arguments"])
+                except json.JSONDecodeError as error:
+                    raise ChatRequestError(
+                        "Tool call arguments must be a JSON object."
+                    ) from error
+    return messages
+
+
 def _get_chat_template(model_kit: object, *, supports_vision: bool) -> Callable:
     if not supports_vision:
         return model_kit.tokenizer._tokenizer.apply_chat_template
@@ -191,8 +221,16 @@ def prepare_chat_generation_request(
     tokenize: Callable[[object, str], list[int]],
 ) -> ChatGenerationRequest:
     request = ChatCompletionRequest.model_validate(body)
+    # Tool calls are parsed for Olala only (mlx_engine.models.olala.parser).
+    channel_tools = False
     if request.tools:
-        raise ChatRequestError("Tools are not supported yet.")
+        if not _is_olala(model_kit):
+            raise ChatRequestError("Tools are not supported yet.")
+        if request.tool_choice not in (None, "auto", "none"):
+            raise ChatRequestError('tool_choice must be "auto" or "none".')
+        if request.response_format is not None:
+            raise ChatRequestError("Structured output is not supported with tools.")
+        channel_tools = request.tool_choice != "none"
 
     unsupported_controls = [
         name
@@ -236,6 +274,10 @@ def prepare_chat_generation_request(
         )
 
     template_kwargs = dict(request.chat_template_kwargs)
+    if _is_olala(model_kit):
+        normalized_messages = _olala_tool_messages(normalized_messages)
+    if channel_tools:
+        template_kwargs["tools"] = request.tools
     if has_assistant_prefill:
         template_kwargs["continue_final_message"] = True
         add_generation_prompt = False
@@ -271,7 +313,15 @@ def prepare_chat_generation_request(
         if value is not None:
             generation_kwargs[name] = value
 
+    channel_reasoning_open = None
+    if _is_olala(model_kit):
+        from mlx_engine.models.olala.parser import reasoning_is_open
+
+        channel_reasoning_open = reasoning_is_open(prompt)
+
     return ChatGenerationRequest(
         prompt_tokens=tokenize(model_kit, prompt),
         generation_kwargs=generation_kwargs,
+        channel_reasoning_open=channel_reasoning_open,
+        channel_tools=channel_tools,
     )
