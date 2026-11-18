@@ -1,0 +1,559 @@
+"""Olala model: fused Metal decode vs the reference path, cache semantics, weight merging.
+
+Uses a tiny randomly initialised configuration, no checkpoint needed.
+"""
+
+import copy
+import importlib
+import os
+
+import mlx.core as mx
+import pytest
+from mlx.utils import tree_flatten, tree_map
+
+from mlx_engine.models.olala import metal, register
+from mlx_engine.models.olala import model as olala_model
+
+register()
+
+TINY = {
+    "model_type": "olala",
+    "vocab_size": 512,
+    "hidden_size": 256,
+    "num_hidden_layers": 5,
+    "layers_config": "MVMMV",
+    "num_attention_heads": 8,
+    "num_signal_heads_diff": 6,
+    "head_dim": 128,
+    "moe_num_routed_experts": 32,
+    "moe_num_active_experts": 6,
+    "moe_routed_input_dim": 64,
+    "moe_routed_intermediate_size": 128,
+    "moe_shared_intermediate_size": 256,
+    "max_position_embeddings": 4096,
+    "slw_wsize": 4096,
+}
+
+
+def _tiny_model(seed=0, dtype=mx.float32):
+    mx.random.seed(seed)
+    args = olala_model.ModelArgs.from_dict(TINY)
+    m = olala_model.Model(args)
+    # small random weights; norms / biases around their trained ranges
+    params = tree_map(lambda p: mx.random.normal(p.shape) * 0.05, m.parameters())
+    m.update(params)
+    for layer in m.model.layers:
+        layer.geodesic_mixer.scale = mx.array([1.0])
+        layer.geodesic_mixer.bias = mx.array([0.05])
+        layer.geodesic_mlp.scale = mx.array([1.0])
+        layer.geodesic_mlp.bias = mx.array([0.05])
+    m.update(tree_map(lambda p: p.astype(dtype), m.parameters()))
+    mx.eval(m.parameters())
+    return m
+
+
+def _decode_logits(m, prompt, steps, fused, monkeypatch):
+    monkeypatch.setenv("OLALA_FUSED", "1" if fused else "0")
+    cache = m.make_cache()
+    logits = m(prompt, cache=cache)
+    tok = mx.argmax(logits[:, -1], axis=-1).reshape(-1, 1)
+    out = []
+    for _ in range(steps):
+        logits = m(tok, cache=cache).astype(mx.float32)[:, -1]
+        out.append(logits)
+        tok = mx.argmax(logits, axis=-1).reshape(-1, 1)
+    return mx.stack(out, axis=1)
+
+
+@pytest.mark.parametrize("batch", [1, 3])
+def test_fused_decode_matches_reference(monkeypatch, batch):
+    monkeypatch.setattr(olala_model, "_ACT_F32", True)
+    m = _tiny_model()
+    prompt = mx.random.randint(0, TINY["vocab_size"], (batch, 21))
+    ref = _decode_logits(m, prompt, 5, fused=False, monkeypatch=monkeypatch)
+    monkeypatch.setenv("OLALA_FUSED", "1")
+    assert metal.can_decode(
+        m.model, mx.zeros((batch, 1, 256)), _primed_cache(m, prompt), None
+    )
+    fused = _decode_logits(m, prompt, 5, fused=True, monkeypatch=monkeypatch)
+    assert mx.allclose(ref, fused, atol=2e-3, rtol=2e-3).item(), (
+        mx.abs(ref - fused).max().item()
+    )
+
+
+def _primed_cache(m, prompt):
+    cache = m.make_cache()
+    mx.eval(m(prompt, cache=cache))
+    return cache
+
+
+def test_chunked_prefill_matches_stepwise(monkeypatch):
+    monkeypatch.setenv("OLALA_FUSED", "0")
+    m = _tiny_model()
+    prompt = mx.random.randint(0, TINY["vocab_size"], (1, 45))
+    full = m(prompt).astype(mx.float32)
+    cache = m.make_cache()
+    parts = [
+        m(prompt[:, s : s + 13], cache=cache).astype(mx.float32)
+        for s in range(0, 45, 13)
+    ]
+    assert mx.allclose(full, mx.concatenate(parts, axis=1), atol=1e-4).item()
+    cache = m.make_cache()
+    steps = [m(prompt[:, i : i + 1], cache=cache).astype(mx.float32) for i in range(45)]
+    assert mx.allclose(full, mx.concatenate(steps, axis=1), atol=1e-4).item()
+
+
+def test_m3_chunked_matches_sequential():
+    m = _tiny_model().layers[0].mixer
+    B, L = 3, 37
+    proj = mx.random.normal((B, L, m.n_static + m.n_dyn))
+    sw = m.P * m.N + m.R * m.N + m.P + m.A
+    st = mx.random.normal((B, m.H, sw)) * 0.1
+    rng = mx.array([[0, L], [3, L - 6], [5, 5]], dtype=mx.int32)
+    prm = metal.m3_param_pack(m)
+    args = (prm, st, m.H, m.P, m.N, m.R, m.A, m.n_static)
+    y0, s0 = metal.m3_prefill(proj, *args, rng=rng)
+    y1, s1 = metal.m3_chunked(proj, *args, rng=rng)
+    assert mx.allclose(s0, s1, atol=1e-4, rtol=1e-4).item()
+    for b, (a, e) in enumerate(rng.tolist()):
+        assert mx.allclose(y0[b, a:e], y1[b, a:e], atol=1e-4, rtol=1e-4).item()
+
+
+@pytest.mark.parametrize("T", [1, 3])
+def test_gemv_split_rows_match_reference(T):
+    # an f32 segment next to a quantized one: the f32 rows are split across simdgroups
+    K = 1536
+    w32 = mx.random.normal((256, K)) * 0.05
+    wq = mx.random.normal((640, K)) * 0.05
+    q, s, b = mx.quantize(wq, group_size=64, bits=6)
+    ws = [metal.W(w32), metal.W(q, s, b, 6, 64)]
+    assert metal._gemv_splits([(w.fmt, w.gs or 0, w.rows) for w in ws], K, 8)[0] > 1
+    x = mx.random.normal((T, K))
+    xr = mx.random.normal((T, 640))
+    y32, yq = metal.gemv([x], ws, T=T)
+    assert mx.allclose(y32, x @ w32.T, atol=1e-4).item()
+    wdq = mx.dequantize(q, s, b, group_size=64, bits=6)
+    assert mx.allclose(yq, x @ wdq.T, atol=1e-4).item()
+    # geodesic sums of a split GEMV
+    y, gst = metal.gemv([x], [ws[1]], T=T, stats_x=xr)
+    ref = mx.stack([(xr * xr).sum(-1), (xr * y).sum(-1), (y * y).sum(-1)], -1)
+    assert mx.allclose(gst[: 4 * T].reshape(T, 4)[:, :3], ref, rtol=1e-4).item()
+
+
+@pytest.mark.parametrize(
+    "T,L,window", [(37, 37, 4096), (300, 133, 4096), (300, 300, 100)]
+)
+def test_attn_prefill_mma_matches_scalar(monkeypatch, T, L, window):
+    q = (mx.random.normal((1, 8, L, 128)) * 3).astype(mx.bfloat16)
+    k = (mx.random.normal((1, 2, T, 128)) * 3).astype(mx.bfloat16)
+    v = mx.random.normal((1, 2, T, 128)).astype(mx.bfloat16)
+    a = metal.attn_prefill_mma(q, k, v, 1 / 128, 150.0, window)
+    monkeypatch.setattr(metal, "_FA_MMA", False)
+    b = metal.attn_prefill(q, k, v, 1 / 128, 150.0, window)
+    assert mx.allclose(a.astype(mx.float32), b.astype(mx.float32), atol=1e-2).item()
+
+
+@pytest.mark.parametrize("S,kstart", [(5, 0), (70, 3), (300, 0)])
+def test_attn_decode_short_matches_long(S, kstart):
+    T, Hq, Hk, Dh = 2, 16, 4, 128
+    keys = (mx.random.normal((T, Hk, S + 9, Dh)) * 2).astype(mx.bfloat16)
+    values = mx.random.normal((T, Hk, S + 9, Dh)).astype(mx.bfloat16)
+    q = mx.random.normal((T, Hq, Dh)) * 3
+    ks = mx.array([kstart, 0], dtype=mx.int32)
+    args = (q, keys, values, ks, 1 / 128, 150.0, T, Hq, Hk, Dh)
+    slen = mx.array([S], dtype=mx.int32)
+
+    def merged(o, m, l):
+        M = m.max(axis=-1, keepdims=True)
+        c = mx.where(m == -mx.inf, 0, mx.exp(m - M))
+        return (o * c[..., None]).sum(-2) / (l * c).sum(-1)[..., None]
+
+    short = merged(*metal.attn_decode_short(*args, S, slen))
+    old = metal.ATT_SHORT_MAX
+    metal.ATT_SHORT_MAX = 0
+    try:
+        long = merged(*metal.attn_decode(*args, S=S, slen=slen))
+    finally:
+        metal.ATT_SHORT_MAX = old
+    assert mx.allclose(short, long, atol=1e-4).item()
+
+
+@pytest.mark.parametrize("T", [1, 3])
+def test_moe_fused_matches_reference(T):
+    from mlx_engine.models.olala import kernels
+
+    m = _tiny_model().layers[0].mlp
+    E, D = m.n_experts, m.d_latent
+    # larger expert weights than _tiny_model's, so that every routed row matters
+    m.experts.experts.weight = mx.random.normal(m.experts.experts.weight.shape) * 0.3
+    m.experts.output_experts.weight = (
+        mx.random.normal(m.experts.output_experts.weight.shape) * 0.3
+    )
+    logits = mx.random.normal((T, E))
+    x0 = mx.random.normal((T, D))
+    inds, probs = kernels.moe_route(logits, m.expert_bias, m.top_k, m.scaling)
+    ref = kernels.moe_experts(x0, inds, probs, m.experts)
+    wu, wd = metal.W(m.experts.experts), metal.W(m.experts.output_experts)
+    out = metal.moe_fused(
+        logits, m.expert_bias.astype(mx.float32), x0, D, wu, wd, m.top_k, m.scaling, T
+    )
+    if out.ndim == 3:  # per-threadgroup partials (deterministic mode)
+        out = out.sum(axis=1)
+    assert mx.allclose(out, ref, rtol=1e-4, atol=1e-4).item(), mx.abs(out - ref).max()
+
+
+def test_cache_layout_one_entry_per_layer():
+    m = _tiny_model()
+    cache = m.make_cache()
+    assert len(cache) == len(m.layers)
+    for layer, c in zip(m.layers, cache, strict=True):
+        if layer.layer_type == "M":
+            assert type(c).__name__ == "ArraysCache"
+        else:
+            assert type(c).__name__ == "CacheList"
+            assert type(c[0]).__name__ == "KVCache"
+    mx.eval(m(mx.zeros((1, 7), mx.int32), cache=cache))
+    assert cache[1].offset == 7
+
+
+def test_kv_inplace_append_is_disabled_on_shared_buffers():
+    c = olala_model.KVCache()
+    c.update_and_fetch(mx.zeros((1, 2, 5, 128)), mx.zeros((1, 2, 5, 128)))
+    assert c.can_append_inplace(1)
+    snap = copy.deepcopy(c)
+    # both share the buffer now: neither may write in place until it has its own
+    assert not c.can_append_inplace(1) and not snap.can_append_inplace(1)
+    c.update_and_fetch(mx.ones((1, 2, 1, 128)), mx.ones((1, 2, 1, 128)))
+    mx.eval(c.keys, snap.keys)
+    assert c.can_append_inplace(1)
+    assert snap.offset == 5 and mx.all(snap.keys[..., :5, :] == 0).item()
+    # trimming below the high-water mark disables in-place appends
+    c.trim(2)
+    assert not c.can_append_inplace(1)
+
+
+def test_sanitize_merges_and_is_idempotent():
+    m = _tiny_model()
+    flat = dict(tree_flatten(m.parameters()))
+    # split the merged matrices back into the HF layout
+    hf = {}
+    d = 256
+    for k, v in flat.items():
+        if (
+            k.endswith("mixer.in_proj.weight")
+            and v.shape[0] == m.layers[0].mixer.n_static + m.layers[0].mixer.n_dyn
+        ):
+            n = m.layers[0].mixer.n_static
+            hf[k] = v[:n]
+            hf[k.replace("in_proj", "in_proj_dyn")] = v[n:]
+        elif k.endswith("mlp.in_cat.weight"):
+            hf[k.replace("in_cat", "down_proj")] = v[:64]
+            hf[k.replace("in_cat", "shared_experts.fc_1")] = v[64:]
+        elif k.endswith("mlp.out_cat.weight"):
+            hf[k.replace("out_cat", "up_proj")] = v[:, :64]
+            hf[k.replace("out_cat", "shared_experts.fc_2")] = v[:, 64:]
+        else:
+            hf[k] = v
+    merged = m.sanitize(hf)
+    again = m.sanitize(dict(merged))
+    assert set(merged) == set(again)
+    for k, v in flat.items():
+        if k.endswith("mixer.in_proj.weight") and v.shape[0] != d and k in merged:
+            assert mx.array_equal(merged[k], v).item()
+    assert mx.array_equal(
+        merged["model.layers.0.mlp.in_cat.weight"],
+        flat["model.layers.0.mlp.in_cat.weight"],
+    ).item()
+    assert mx.array_equal(
+        merged["model.layers.0.mlp.out_cat.weight"],
+        flat["model.layers.0.mlp.out_cat.weight"],
+    ).item()
+
+
+def test_registered_for_mlx_lm_and_mlx_vlm():
+    assert importlib.import_module("mlx_lm.models.olala").Model is olala_model.Model
+    vlm = importlib.import_module("mlx_vlm.models.olala")
+    cfg = vlm.ModelConfig.from_dict(dict(TINY, unknown_key=1))
+    model = vlm.Model(cfg)
+    assert len(model.make_cache()) == TINY["num_hidden_layers"]
+
+
+@pytest.mark.skipif(os.environ.get("OLALA_TEST_QUANT") == "0", reason="disabled")
+@pytest.mark.parametrize("bits", [8, 6, 5, 4])
+def test_fused_decode_quantized(monkeypatch, bits):
+    monkeypatch.setattr(olala_model, "_ACT_F32", True)
+    from mlx import nn
+
+    m = _tiny_model()
+    nn.quantize(
+        m,
+        group_size=64,
+        bits=bits,
+        class_predicate=lambda p, mod: (
+            m.quant_predicate(p, mod) and hasattr(mod, "to_quantized")
+        ),
+    )
+    prompt = mx.random.randint(0, TINY["vocab_size"], (2, 17))
+    ref = _decode_logits(m, prompt, 4, fused=False, monkeypatch=monkeypatch)
+    fused = _decode_logits(m, prompt, 4, fused=True, monkeypatch=monkeypatch)
+    assert mx.allclose(ref, fused, atol=5e-3, rtol=5e-3).item(), (
+        mx.abs(ref - fused).max().item()
+    )
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+def test_factored_cache_matches_full(monkeypatch, batch):
+    """Factored (TPA) KV cache: prefill in chunks then decode, against the full cache (reference path)."""
+    monkeypatch.setenv("OLALA_FUSED", "0")
+    m = _tiny_model()
+    prompt = mx.random.randint(0, TINY["vocab_size"], (batch, 45))
+    out = {}
+    for layout in ("full", "factored"):
+        monkeypatch.setattr(olala_model, "_TPA_CACHE", layout)
+        cache = m.make_cache()
+        logits = [m(prompt[:, s : s + 16], cache=cache).astype(mx.float32) for s in range(0, 45, 16)]
+        tok = prompt[:, :1]
+        for i in range(6):
+            logits.append(m(tok, cache=cache).astype(mx.float32))
+            tok = prompt[:, i + 1 : i + 2]
+        out[layout] = mx.concatenate(logits, axis=1)
+    assert mx.allclose(out["full"], out["factored"], atol=1e-4).item(), (
+        mx.abs(out["full"] - out["factored"]).max().item()
+    )
+
+
+def test_tpa_decode_matches_attn_decode():
+    """tpa_decode (factored cache, Metal 4 tensor API) against attn_decode over the expanded K / V (Olala dims)."""
+    Hq, Hk, Dh, R, T, S = 48, 12, 128, 4, 2, 1500
+    mx.random.seed(0)
+    cap = S + 64
+    rows_k = (mx.random.normal((T, cap, R, Dh)) * 0.5).astype(mx.bfloat16)
+    rows_v = (mx.random.normal((T, cap, R, Dh)) * 0.5).astype(mx.bfloat16)
+    coef_k = mx.random.normal((T, cap, Hk, 2 * R)) * 0.6
+    coef_v = mx.random.normal((T, cap, Hk, 2 * R)) * 0.3
+    coef_k[:, 0, :, R:] = 0
+    coef_v[:, 0, :, R:] = 0
+
+    def expand(rows, coef):
+        r = rows[:, :S].astype(mx.float32)
+        rp = mx.concatenate([mx.zeros_like(r[:, :1]), r[:, :-1]], axis=1)
+        return (coef[:, :S] @ mx.concatenate([r, rp], axis=2)).transpose(0, 2, 1, 3)
+
+    q = mx.random.normal((T, Hq, Dh)).astype(mx.bfloat16)
+    kstart = mx.array([0, S // 3], dtype=mx.int32)
+    slen = mx.array([S], dtype=mx.int32)
+
+    def merge(o, m_, l_):
+        M = m_.max(axis=-1, keepdims=True)
+        c = mx.where(m_ == -mx.inf, 0.0, mx.exp(m_ - M))
+        return (o * c[..., None]).sum(-2) / (l_ * c).sum(-1)[..., None]
+
+    ref = merge(*metal.attn_decode(q.astype(mx.float32), expand(rows_k, coef_k), expand(rows_v, coef_v),
+                                   kstart, 1 / 128, 150.0, T, Hq, Hk, Dh, S=S, slen=slen))
+    try:
+        got = merge(*metal.tpa_decode(q, rows_k, rows_v, coef_k, coef_v, kstart, slen, S, 1 / 128, 150.0,
+                                      T, Hq, Hk, Dh, R))
+        mx.eval(got)
+    except RuntimeError as e:  # no Metal 4 tensor API (pre-M5 GPU / older OS)
+        pytest.skip(str(e).splitlines()[0])
+    err = (mx.abs(got - ref).max() / mx.abs(ref).max()).item()
+    assert err < 2e-3, err
+
+
+def _factored_cache(n, seed, R=4, Dh=128, Hk=2):
+    mx.random.seed(seed)
+    c = olala_model.FactoredKVCache()
+    if n:
+        c.append(
+            mx.random.normal((1, n, R, Dh)).astype(mx.bfloat16),
+            mx.random.normal((1, n, R, Dh)).astype(mx.bfloat16),
+            mx.random.normal((1, n, Hk, 2 * R)),
+            mx.random.normal((1, n, Hk, 2 * R)),
+        )
+    return c
+
+
+def _expanded(c):
+    """mlx-lm KVCache holding the expanded K / V of a FactoredKVCache (the reference layout)."""
+    from mlx_lm.models.cache import KVCache as MlxKVCache
+
+    ref = MlxKVCache()
+    if c.offset:
+        ref.update_and_fetch(*c.expand(mx.float32))
+    return ref
+
+
+def test_batch_factored_cache_follows_batch_kv_cache():
+    """BatchFactoredKVCache bookkeeping (merge, filter, extend, extract) against mlx-lm's BatchKVCache on the
+    expanded K / V of the same sequences."""
+    from mlx_lm.models.cache import BatchKVCache
+
+    def same(fac, ref):
+        mx.eval(fac.left_padding, ref.left_padding)
+        assert fac.left_padding.tolist() == ref.left_padding.tolist()
+        assert fac.offset.tolist() == ref.offset.tolist() and fac.size() == ref.size()
+        assert fac.cap >= fac.size() + fac.PAD
+        k, v = fac.expand(mx.float32)
+        rk, rv = ref.keys_and_values()
+        lp = ref.left_padding.tolist()
+        for b, p in enumerate(lp):  # padding cells hold nothing meaningful
+            assert mx.allclose(k[b, :, p:], rk[b, :, p:], atol=1e-4).item()
+            assert mx.allclose(v[b, :, p:], rv[b, :, p:], atol=1e-4).item()
+
+    seqs = [_factored_cache(n, s) for s, n in enumerate([5, 0, 40, 17])]
+    fac = olala_model.BatchFactoredKVCache.merge(seqs)
+    ref = BatchKVCache.merge([_expanded(c) for c in seqs])
+    assert ref.left_padding.tolist() == [35, 40, 0, 23]
+    same(fac, ref)
+    fac.filter([0, 3])
+    ref.filter([0, 3])
+    same(fac, ref)
+    more = [_factored_cache(n, 10 + s) for s, n in enumerate([60, 2])]
+    fac.extend(olala_model.BatchFactoredKVCache.merge(more))
+    ref.extend(BatchKVCache.merge([_expanded(c) for c in more]))
+    same(fac, ref)
+    for i, n in enumerate([5, 17, 60, 2]):
+        one = fac.extract(i)
+        assert isinstance(one, olala_model.FactoredKVCache) and one.offset == n
+        k, _ = one.expand(mx.float32)
+        rk, _ = ref.extract(i).keys_and_values()
+        assert mx.allclose(k, rk, atol=1e-4).item()
+
+
+@pytest.mark.parametrize("layout,fused", [("full", "0"), ("factored", "0"), ("full", "1")])
+def test_batch_generator_matches_single_sequences(monkeypatch, layout, fused):
+    """Continuous batching (mlx-lm BatchGenerator: prompts of different lengths, sequences joining while others
+    generate) gives the same greedy tokens as decoding each sequence alone. The fused factored decode needs
+    Olala's 48 heads (not the tiny model); it is checked against tpa_decode's reference in the test above."""
+    from mlx_lm.generate import BatchGenerator
+
+    monkeypatch.setenv("OLALA_FUSED", fused)
+    monkeypatch.setattr(olala_model, "_ACT_F32", True)
+    monkeypatch.setattr(olala_model, "_TPA_CACHE", layout)
+    m = _tiny_model()
+    mx.random.seed(1)
+    prompts = [mx.random.randint(0, TINY["vocab_size"], (n,)).tolist() for n in [37, 5, 70, 12, 3, 50]]
+    N = 10
+
+    def single(p):
+        cache = m.make_cache()
+        logits = m(mx.array([p]), cache=cache)[:, -1]
+        out = []
+        for _ in range(N):
+            t = mx.argmax(logits, axis=-1)
+            out.append(t.item())
+            logits = m(t.reshape(1, 1), cache=cache)[:, -1]
+        return out
+
+    ref = [single(p) for p in prompts]
+    decode = metal.can_decode
+    steps = {"fused": 0}
+
+    def spy(*a, **k):
+        ok = decode(*a, **k)
+        steps["fused"] += ok
+        return ok
+
+    monkeypatch.setattr(metal, "can_decode", spy)
+    gen = BatchGenerator(m, max_tokens=N, prefill_batch_size=2, completion_batch_size=4)
+    uids = list(gen.insert(prompts[:3]))
+    got = {}
+    for step in range(200):
+        if step == 3:
+            uids += gen.insert(prompts[3:])
+        for r in gen.next_generated():
+            got.setdefault(r.uid, []).append(r.token)
+        if len(got) == len(prompts) and all(len(v) == N for v in got.values()):
+            break
+    gen.close()
+    if layout == "factored":
+        kinds = {type(c[0]).__name__ for c in m.make_cache() if hasattr(c, "caches")}
+        assert kinds == {"FactoredKVCache"}
+    assert (steps["fused"] > 0) == (fused == "1")
+    assert [got.get(u) for u in uids] == ref
+
+
+@pytest.mark.parametrize("layout", ["full", "factored"])
+def test_vlm_cache_layout_and_prompt_cache_round_trip(monkeypatch, layout):
+    """mlx-vlm wrapper (mlx-engine's BatchedVisionModelKit): make_cache follows the layout, and a cache saved the
+    way the prompt cache does it (class name, state, meta_state, extract(0) snapshot) restores through mlx-vlm's
+    cache module and decodes like the original."""
+    from mlx_vlm.models import cache as vlm_cache
+
+    monkeypatch.setenv("OLALA_FUSED", "0")
+    monkeypatch.setattr(olala_model, "_TPA_CACHE", layout)
+    vlm = importlib.import_module("mlx_vlm.models.olala")
+    m = _tiny_model()
+    lm = vlm.LanguageModel(vlm.ModelConfig.from_dict(TINY))
+    lm.update(m.parameters())
+    cache = lm.make_cache()
+    kv = {type(c[0]).__name__ for c in cache if hasattr(c, "caches")}
+    assert kv == {"FactoredKVCache" if layout == "factored" else "KVCache"}
+    prompt = mx.random.randint(0, TINY["vocab_size"], (1, 33))
+    mx.eval(lm(prompt, cache=cache).logits)
+
+    snap = [c.extract(0) if hasattr(c, "extract") else c for c in cache]
+    names = [type(c).__name__ for c in snap]
+    state, meta = [c.state for c in snap], [c.meta_state for c in snap]
+    mx.eval(state)
+    restored = [getattr(vlm_cache, n).from_state(s, mm) for n, s, mm in zip(names, state, meta)]
+
+    tok = prompt[:, -1:]
+    a = lm(tok, cache=cache).logits
+    b = lm(tok, cache=restored).logits
+    assert mx.allclose(a, b, atol=1e-5).item(), mx.abs(a - b).max().item()
+
+
+@pytest.mark.parametrize("layout", ["full", "factored"])
+@pytest.mark.parametrize("fused", [True, False])
+def test_cache_snapshots_are_isolated_from_later_requests(monkeypatch, layout, fused):
+    """mlx-engine's prompt cache keeps deepcopy snapshots (checkpoint before the end of the
+    prompt, live cache after the generation) and restores them for later requests. A request
+    that restarts from an older snapshot and writes a different continuation must not change
+    what the other snapshots hold."""
+    monkeypatch.setattr(olala_model, "_ACT_F32", True)
+    monkeypatch.setattr(olala_model, "_TPA_CACHE", layout)
+    monkeypatch.setenv("OLALA_FUSED", "1" if fused else "0")
+    m = _tiny_model()
+    V = TINY["vocab_size"]
+    prefix = mx.random.randint(0, V, (1, 23))
+    first = mx.random.randint(0, V, (1, 9))  # request 1: rest of its prompt
+    other = mx.random.randint(0, V, (1, 14))  # request 2: a different continuation
+    probe = mx.random.randint(0, V, (1, 1))
+
+    def decode(cache, tokens):
+        out = None
+        for i in range(tokens.shape[1]):
+            out = m(tokens[:, i : i + 1], cache=cache).astype(mx.float32)[:, -1]
+            mx.eval(out)
+        return out
+
+    def request_1(cache):
+        mx.eval(m(first, cache=cache))
+        decode(cache, first[:, :5])  # "generated" tokens
+
+    # reference: request 1 alone, then the probe token
+    ref_cache = m.make_cache()
+    mx.eval(m(prefix, cache=ref_cache))
+    request_1(ref_cache)
+    ref = decode(ref_cache, probe)
+
+    live = m.make_cache()
+    mx.eval(m(prefix, cache=live))
+    checkpoint = copy.deepcopy(live)
+    request_1(live)
+    after_request_1 = copy.deepcopy(live)
+
+    # request 2 restarts from the checkpoint and overwrites the same positions
+    live = copy.deepcopy(checkpoint)
+    mx.eval(m(other, cache=live))
+    decode(live, other[:, :6])
+
+    # request 3 continues request 1
+    got = decode(copy.deepcopy(after_request_1), probe)
+    assert mx.allclose(ref, got, atol=2e-3, rtol=2e-3).item(), mx.abs(ref - got).max().item()
+    # and the checkpoint still gives request 1's result
+    live = copy.deepcopy(checkpoint)
+    request_1(live)
+    got = decode(live, probe)
+    assert mx.allclose(ref, got, atol=2e-3, rtol=2e-3).item(), mx.abs(ref - got).max().item()
