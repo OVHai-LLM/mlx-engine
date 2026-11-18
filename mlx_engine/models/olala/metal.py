@@ -1456,7 +1456,35 @@ def _m3c_prep(proj, prm, st, rng, H, P, N, R, A, n_static):
     )
 
 
+_m3c_ps = None  # M3C_PS that this GPU accepts, found on the first chunked prefill
+
+
 def m3_chunked(proj, prm, st, H, P, N, R, A, n_static, rng=None):
+    """m3_chunked_ps with the threadgroups-per-head this GPU accepts.
+
+    PS = M3C_PS = 1 gives P / 4 = 16 simdgroups (512 threads) per threadgroup, above the
+    384-thread pipeline limit of this kernel on M1 (applegpu_g13). The first call evaluates
+    eagerly; if Metal rejects the threadgroup size it retries with PS = 2 (8 simdgroups) and
+    keeps that for the process. OLALA_M3C_PS forces a value."""
+    global _m3c_ps
+    args = (proj, prm, st, H, P, N, R, A, n_static, rng)
+    if _m3c_ps is None and os.environ.get("OLALA_M3C_PS"):
+        _m3c_ps = int(os.environ["OLALA_M3C_PS"])
+    if _m3c_ps is not None:
+        return m3_chunked_ps(*args, PS=_m3c_ps)
+    for ps in (M3C_PS, 2 * M3C_PS):
+        try:
+            out = m3_chunked_ps(*args, PS=ps)
+            mx.eval(out)
+        except ValueError as e:
+            if "threads per threadgroup" not in str(e) or ps != M3C_PS:
+                raise
+            continue
+        _m3c_ps = ps
+        return out
+
+
+def m3_chunked_ps(proj, prm, st, H, P, N, R, A, n_static, rng=None, PS=M3C_PS):
     """Mamba-3 MIMO over a prompt in chunks of T tokens with simdgroup matrix products.
 
     Same interface and result as m3_prefill. Per chunk (rows (t, r) of the T*R queries / keys):
@@ -1470,7 +1498,7 @@ def m3_chunked(proj, prm, st, H, P, N, R, A, n_static, rng=None):
     m3_prefill at 2k tokens (limited by the simdgroup matrix throughput)."""
     B, L, _PW = proj.shape
     SW = P * N + R * N + P + A
-    T, PS = M3C_T, M3C_PS
+    T = M3C_T
     TR, PL = T * R, P // PS
     NSG_ = PL // 4  # simdgroup g owns state tiles (p block g / 2, n half g % 2)
     NT = NSG_ * 32
